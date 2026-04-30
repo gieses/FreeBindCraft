@@ -1,0 +1,44 @@
+# simplified environmental set-up, colabfold and freebindcraft need special treatment after installation
+# hook: pip install git+https://github.com/sokrypton/ColabDesign.git --no-deps
+# hook: pip install git+https://github.com/cytokineking/FreeBindCraft --no-deps
+
+name: freebindcraft
+channels:
+  - conda-forge
+  - bioconda
+  - sdvillal
+  - nodefaults
+
+dependencies:
+  - python
+  - cuda-nvcc
+  - cuda-version >= 12.8, <13.0
+  - pandas
+  - matplotlib
+  - numpy<2.0.0
+  - biopython
+  - scipy
+  - pdbfixer
+  - openmm
+  - seaborn
+  - libgfortran5
+  - tqdm
+  - jupyter
+  - ffmpeg
+  - fsspec
+  - py3dmol
+  - chex
+  - dm-haiku
+  - flax<0.10.0
+  - dm-tree
+  - joblib
+  - ml-collections
+  - immutabledict
+  - optax
+  - jax >=0.6, <0.8
+  - jaxlib=*=cuda*
+  - dssp
+  - loguru
+  - pip:
+      - freesasa
+      - git+https://github.com/sokrypton/ColabDesign.git

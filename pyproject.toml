@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freebindcraft"
+version = "0.1.0"
+description = "FreeBindCraft – binder design without PyRosetta"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+bindcraft = "freebindcraft.bin:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

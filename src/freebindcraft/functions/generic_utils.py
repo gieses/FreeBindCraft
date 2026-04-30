@@ -2,34 +2,47 @@
 ################## General functions
 ####################################
 ### Import dependencies
-import os
 import json
-import jax
+import os
 import shutil
-import zipfile
-import random
-import math
 import stat
-import pandas as pd
-import numpy as np
 import time
+import zipfile
+
+import jax
+import numpy as np
+import pandas as pd
+
 from .logging_utils import vprint
+
 
 # Define labels for dataframes
 def generate_dataframe_labels():
     # labels for trajectory
-    trajectory_labels = ['Design', 'Protocol', 'Length', 'Seed', 'Helicity', 'Target_Hotspot', 'Sequence', 'InterfaceResidues', 'pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes',
-                        'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity', 'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues',
-                        'n_InterfaceHbonds', 'InterfaceHbondsPercentage', 'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%',
-                        'Binder_Helix%', 'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Target_RMSD', 'TrajectoryTime', 'Notes', 'TargetSettings', 'Filters', 'AdvancedSettings']
+    trajectory_labels = ['Design', 'Protocol', 'Length', 'Seed', 'Helicity', 'Target_Hotspot', 'Sequence',
+                         'InterfaceResidues', 'pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT',
+                         'Unrelaxed_Clashes',
+                         'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity', 'ShapeComplementarity',
+                         'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity',
+                         'n_InterfaceResidues',
+                         'n_InterfaceHbonds', 'InterfaceHbondsPercentage', 'n_InterfaceUnsatHbonds',
+                         'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%',
+                         'Interface_Loop%',
+                         'Binder_Helix%', 'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Target_RMSD',
+                         'TrajectoryTime', 'Notes', 'TargetSettings', 'Filters', 'AdvancedSettings']
 
     # labels for mpnn designs
-    core_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
-                    'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
-                    'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%', 
-                    'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD', 'Binder_pLDDT', 'Binder_pTM', 'Binder_pAE', 'Binder_RMSD']
+    core_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes',
+                   'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
+                   'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%',
+                   'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
+                   'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%',
+                   'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
+                   'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD', 'Binder_pLDDT',
+                   'Binder_pTM', 'Binder_pAE', 'Binder_RMSD']
 
-    design_labels = ['Design', 'Protocol', 'Length', 'Seed', 'Helicity', 'Target_Hotspot', 'Sequence', 'InterfaceResidues', 'MPNN_score', 'MPNN_seq_recovery']
+    design_labels = ['Design', 'Protocol', 'Length', 'Seed', 'Helicity', 'Target_Hotspot', 'Sequence',
+                     'InterfaceResidues', 'MPNN_score', 'MPNN_seq_recovery']
 
     for label in core_labels:
         design_labels += ['Average_' + label] + [f'{i}_{label}' for i in range(1, 6)]
@@ -40,12 +53,15 @@ def generate_dataframe_labels():
 
     return trajectory_labels, design_labels, final_labels
 
+
 # Create base directions of the project
 def generate_directories(design_path):
     t0 = time.time()
-    design_path_names = ["Accepted", "Accepted/Ranked", "Accepted/Animation", "Accepted/Plots", "Accepted/Pickle", "Trajectory",
-                        "Trajectory/Relaxed", "Trajectory/Plots", "Trajectory/Clashing", "Trajectory/LowConfidence", "Trajectory/Animation",
-                        "Trajectory/Pickle", "MPNN", "MPNN/Binder", "MPNN/Sequences", "MPNN/Relaxed", "Rejected"]
+    design_path_names = ["Accepted", "Accepted/Ranked", "Accepted/Animation", "Accepted/Plots", "Accepted/Pickle",
+                         "Trajectory",
+                         "Trajectory/Relaxed", "Trajectory/Plots", "Trajectory/Clashing", "Trajectory/LowConfidence",
+                         "Trajectory/Animation",
+                         "Trajectory/Pickle", "MPNN", "MPNN/Binder", "MPNN/Sequences", "MPNN/Relaxed", "Rejected"]
     design_paths = {}
 
     # make directories and set design_paths[FOLDER_NAME] variable
@@ -54,8 +70,9 @@ def generate_directories(design_path):
         os.makedirs(path, exist_ok=True)
         design_paths[name] = path
 
-    vprint(f"[GenUtils] Directories prepared in {time.time()-t0:.2f}s")
+    vprint(f"[GenUtils] Directories prepared in {time.time() - t0:.2f}s")
     return design_paths
+
 
 # generate CSV file for tracking designs not passing filters
 def generate_filter_pass_csv(failure_csv, filter_json):
@@ -63,9 +80,10 @@ def generate_filter_pass_csv(failure_csv, filter_json):
     if not os.path.exists(failure_csv):
         with open(filter_json, 'r') as file:
             data = json.load(file)
-        
+
         # Create a list of modified keys
-        names = ['Trajectory_logits_pLDDT', 'Trajectory_softmax_pLDDT', 'Trajectory_one-hot_pLDDT', 'Trajectory_final_pLDDT', 'Trajectory_Contacts', 'Trajectory_Clashes', 'Trajectory_WrongHotspot']
+        names = ['Trajectory_logits_pLDDT', 'Trajectory_softmax_pLDDT', 'Trajectory_one-hot_pLDDT',
+                 'Trajectory_final_pLDDT', 'Trajectory_Contacts', 'Trajectory_Clashes', 'Trajectory_WrongHotspot']
         special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
         tracked_filters = set()
 
@@ -98,20 +116,21 @@ def generate_filter_pass_csv(failure_csv, filter_json):
         df.loc[0] = [0] * len(names)
 
         df.to_csv(failure_csv, index=False)
-        vprint(f"[GenUtils] Initialized failure CSV in {time.time()-t0:.2f}s")
+        vprint(f"[GenUtils] Initialized failure CSV in {time.time() - t0:.2f}s")
+
 
 # update failure rates from trajectories and early predictions
 def update_failures(failure_csv, failure_column_or_dict):
     t0 = time.time()
     failure_df = pd.read_csv(failure_csv)
-    
+
     def strip_model_prefix(name):
         # Strips the model-specific prefix if it exists
         parts = name.split('_')
         if parts[0].isdigit():
             return '_'.join(parts[1:])
         return name
-    
+
     # update dictionary coming from complex prediction
     if isinstance(failure_column_or_dict, dict):
         # Update using a dictionary of failures
@@ -128,22 +147,27 @@ def update_failures(failure_csv, failure_column_or_dict):
             failure_df[failure_column] += 1
         else:
             failure_df[failure_column] = 1
-    
+
     failure_df.to_csv(failure_csv, index=False)
-    vprint(f"[GenUtils] Updated failure CSV in {time.time()-t0:.2f}s")
+    vprint(f"[GenUtils] Updated failure CSV in {time.time() - t0:.2f}s")
+
 
 # Check if number of trajectories generated
 def check_n_trajectories(design_paths, advanced_settings):
-    n_trajectories = [f for f in os.listdir(design_paths["Trajectory/Relaxed"]) if f.endswith('.pdb') and not f.startswith('.')]
+    n_trajectories = [f for f in os.listdir(design_paths["Trajectory/Relaxed"]) if
+                      f.endswith('.pdb') and not f.startswith('.')]
 
-    if advanced_settings["max_trajectories"] is not False and len(n_trajectories) >= advanced_settings["max_trajectories"]:
+    if advanced_settings["max_trajectories"] is not False and len(n_trajectories) >= advanced_settings[
+        "max_trajectories"]:
         print(f"Target number of {str(len(n_trajectories))} trajectories reached, stopping execution...")
         return True
     else:
         return False
 
+
 # Check if we have required number of accepted targets, rank them, and analyse sequence and structure properties
-def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels, rank_by='Average_i_pTM'):
+def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings,
+                           design_labels, rank_by='Average_i_pTM'):
     t0 = time.time()
     accepted_binders = [f for f in os.listdir(design_paths["Accepted"]) if f.endswith('.pdb') and not f.startswith('.')]
 
@@ -157,7 +181,7 @@ def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, adva
         # load dataframe of designed binders
         design_df = pd.read_csv(mpnn_csv)
         design_df = design_df.sort_values(rank_by, ascending=False)
-        
+
         # create final csv dataframe to copy matched rows, initialize with the column labels
         final_df = pd.DataFrame(columns=final_labels)
 
@@ -171,7 +195,8 @@ def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, adva
                     row_data = {'Rank': rank, **{label: row[label] for label in design_labels}}
                     final_df = pd.concat([final_df, pd.DataFrame([row_data])], ignore_index=True)
                     old_path = os.path.join(design_paths["Accepted"], binder)
-                    new_path = os.path.join(design_paths["Accepted/Ranked"], f"{rank}_{target_settings['binder_name']}_model{model.rsplit('.', 1)[0]}.pdb")
+                    new_path = os.path.join(design_paths["Accepted/Ranked"],
+                                            f"{rank}_{target_settings['binder_name']}_model{model.rsplit('.', 1)[0]}.pdb")
                     shutil.copyfile(old_path, new_path)
 
                     rank += 1
@@ -179,7 +204,7 @@ def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, adva
 
         # save the final_df to final_csv
         final_df.to_csv(final_csv, index=False)
-        vprint(f"[GenUtils] Reranking and final CSV write in {time.time()-t0:.2f}s")
+        vprint(f"[GenUtils] Reranking and final CSV write in {time.time() - t0:.2f}s")
 
         # zip large folders to save space
         if advanced_settings["zip_animations"]:
@@ -191,14 +216,15 @@ def check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, adva
         return True
 
     else:
-        vprint(f"[GenUtils] Accepted count below target; check in {time.time()-t0:.2f}s")
+        vprint(f"[GenUtils] Accepted count below target; check in {time.time() - t0:.2f}s")
         return False
+
 
 # Load required helicity value
 def load_helicity(advanced_settings):
     if advanced_settings["random_helicity"] is True:
         # will sample a random bias towards helicity
-        helicity_value = round(np.random.uniform(-3, 1),2)
+        helicity_value = round(np.random.uniform(-3, 1), 2)
     elif advanced_settings["weights_helicity"] != 0:
         # using a preset helicity bias
         helicity_value = advanced_settings["weights_helicity"]
@@ -206,6 +232,7 @@ def load_helicity(advanced_settings):
         # no bias towards helicity
         helicity_value = 0
     return helicity_value
+
 
 # Report JAX-capable devices
 def check_jax_gpu():
@@ -220,6 +247,7 @@ def check_jax_gpu():
         print("Available GPUs:")
         for i, device in enumerate(devices):
             print(f"{device.device_kind}{i + 1}: {device.platform}")
+
 
 # check all input files being passed
 def perform_input_check(args):
@@ -241,6 +269,7 @@ def perform_input_check(args):
 
     return args.settings, args.filters, args.advanced
 
+
 # check specific advanced settings
 def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
     # set paths to model weights and executables
@@ -257,7 +286,7 @@ def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
         if not advanced_settings["dalphaball_path"]:
             advanced_settings["dalphaball_path"] = os.path.join(bindcraft_folder, 'functions', 'DAlphaBall.gcc')
 
-    # check formatting of omit_AAs setting
+        # check formatting of omit_AAs setting
         omit_aas = advanced_settings["omit_AAs"]
     if advanced_settings["omit_AAs"] in [None, False, '']:
         advanced_settings["omit_AAs"] = None
@@ -274,6 +303,7 @@ def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
     _ensure_required_executables(advanced_settings, bindcraft_folder)
 
     return advanced_settings
+
 
 def _ensure_required_executables(advanced_settings, bindcraft_folder):
     """
@@ -292,7 +322,8 @@ def _ensure_required_executables(advanced_settings, bindcraft_folder):
                     pass
 
         # DAlphaBall (only relevant if PyRosetta is used)
-        dalphaball_path = advanced_settings.get("dalphaball_path") or os.path.join(bindcraft_folder, 'functions', 'DAlphaBall.gcc')
+        dalphaball_path = advanced_settings.get("dalphaball_path") or os.path.join(bindcraft_folder, 'functions',
+                                                                                   'DAlphaBall.gcc')
         if isinstance(dalphaball_path, str) and os.path.isfile(dalphaball_path):
             st = os.stat(dalphaball_path)
             if not (st.st_mode & stat.S_IXUSR):
@@ -303,6 +334,7 @@ def _ensure_required_executables(advanced_settings, bindcraft_folder):
     except Exception:
         # Never crash on permission fix attempts
         pass
+
 
 # Load settings from JSONs
 def load_json_settings(settings_json, filters_json, advanced_json):
@@ -318,18 +350,20 @@ def load_json_settings(settings_json, filters_json, advanced_json):
 
     return target_settings, advanced_settings, filters
 
+
 # AF2 model settings, make sure non-overlapping models with template option are being used for design and re-prediction
 def load_af2_models(af_multimer_setting):
     if af_multimer_setting:
-        design_models = [0,1,2,3,4]
-        prediction_models = [0,1]
+        design_models = [0, 1, 2, 3, 4]
+        prediction_models = [0, 1]
         multimer_validation = False
     else:
-        design_models = [0,1]
-        prediction_models = [0,1,2,3,4]
+        design_models = [0, 1]
+        prediction_models = [0, 1, 2, 3, 4]
         multimer_validation = True
 
     return design_models, prediction_models, multimer_validation
+
 
 # migrate existing CSV to include new columns (backwards compatibility)
 def migrate_csv_columns(csv_path, expected_columns):
@@ -348,7 +382,7 @@ def migrate_csv_columns(csv_path, expected_columns):
     """
     if not os.path.exists(csv_path):
         return False
-    
+
     try:
         df = pd.read_csv(csv_path)
     except pd.errors.EmptyDataError:
@@ -357,23 +391,23 @@ def migrate_csv_columns(csv_path, expected_columns):
     except Exception as e:
         print(f"Warning: Could not read {csv_path} for migration: {e}")
         return False
-    
+
     if df.empty and len(df.columns) == 0:
         return False
-    
+
     existing_columns = list(df.columns)
-    
+
     # Check if migration is needed
     if existing_columns == expected_columns:
         return False
-    
+
     # Check if we actually need to add any new columns
     new_cols = set(expected_columns) - set(existing_columns)
     needs_reorder = existing_columns != expected_columns
-    
+
     if not new_cols and not needs_reorder:
         return False
-    
+
     # Build column data dictionary efficiently (avoids fragmentation warnings)
     col_data = {}
     for col in expected_columns:
@@ -382,22 +416,23 @@ def migrate_csv_columns(csv_path, expected_columns):
         else:
             # New column - fill with None for existing rows
             col_data[col] = [None] * len(df)
-    
+
     # Create DataFrame in one shot from dictionary (efficient, no warnings)
     migrated_df = pd.DataFrame(col_data, columns=expected_columns)
-    
+
     if new_cols:
         print(f"Migrating {os.path.basename(csv_path)}: adding columns {new_cols}")
         migrated_df.to_csv(csv_path, index=False)
         return True
-    
+
     # Columns might just be reordered (shouldn't happen, but handle gracefully)
     if needs_reorder:
         print(f"Reordering columns in {os.path.basename(csv_path)}")
         migrated_df.to_csv(csv_path, index=False)
         return True
-    
+
     return False
+
 
 # create csv for insertion of data
 def create_dataframe(csv_file, columns):
@@ -405,21 +440,24 @@ def create_dataframe(csv_file, columns):
     if not os.path.exists(csv_file):
         df = pd.DataFrame(columns=columns)
         df.to_csv(csv_file, index=False)
-        vprint(f"[GenUtils] Created CSV {csv_file} in {time.time()-t0:.2f}s")
+        vprint(f"[GenUtils] Created CSV {csv_file} in {time.time() - t0:.2f}s")
+
 
 # insert row of statistics into csv
 def insert_data(csv_file, data_array):
     t0 = time.time()
     df = pd.DataFrame([data_array])
     df.to_csv(csv_file, mode='a', header=False, index=False)
-    vprint(f"[GenUtils] Appended row to {csv_file} in {time.time()-t0:.2f}s")
+    vprint(f"[GenUtils] Appended row to {csv_file} in {time.time() - t0:.2f}s")
+
 
 # save generated sequence
 def save_fasta(design_name, sequence, design_paths):
-    fasta_path = os.path.join(design_paths["MPNN/Sequences"], design_name+".fasta")
-    with open(fasta_path,"w") as fasta:
+    fasta_path = os.path.join(design_paths["MPNN/Sequences"], design_name + ".fasta")
+    with open(fasta_path, "w") as fasta:
         line = f'>{design_name}\n{sequence}'
-        fasta.write(line+"\n")
+        fasta.write(line + "\n")
+
 
 # clean unnecessary rosetta information from PDB
 def clean_pdb(pdb_file):
@@ -433,6 +471,7 @@ def clean_pdb(pdb_file):
     # Write the cleaned lines back to the original pdb file
     with open(pdb_file, 'w') as f_out:
         f_out.writelines(relevant_lines)
+
 
 def zip_and_empty_folder(folder_path, extension):
     folder_basename = os.path.basename(folder_path)
@@ -449,6 +488,7 @@ def zip_and_empty_folder(folder_path, extension):
                 # Remove the file after adding it to the zip
                 os.remove(file_path)
     print(f"Files in folder '{folder_path}' have been zipped and removed.")
+
 
 # calculate averages for statistics
 def calculate_averages(statistics, handle_aa=False):
@@ -487,10 +527,11 @@ def calculate_averages(statistics, handle_aa=False):
 
     # If we're handling aa counts, calculate their averages
     if handle_aa:
-        aa_averages = {aa: round(total / len(statistics),2) for aa, total in aa_sums.items()}
+        aa_averages = {aa: round(total / len(statistics), 2) for aa, total in aa_sums.items()}
         averages['InterfaceAAs'] = aa_averages
 
     return averages
+
 
 # filter designs based on feature thresholds
 def check_filters(mpnn_data, design_labels, filters):

@@ -1,5 +1,8 @@
 # FreeBindCraft: BindCraft with Optional PyRosetta Bypass
 
+Fork of the popular BindCraft package.
+
+
 <p align="center">
   <img src="./free-bindcraft.png" alt="FreeBindCraft" width="720" />
 </p>

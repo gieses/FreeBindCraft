@@ -1,38 +1,92 @@
-####################################
-###################### BindCraft Run
-####################################
-### Import dependencies
+# bindcraft entrypoint
+import argparse
 import gc
-from functions import *
-from functions.generic_utils import insert_data # Explicit import for insert_data
-from functions.biopython_utils import clear_dssp_cache # Explicit import for DSSP cache management
-import logging
+import json
 import os
+import shutil
 import sys
-import subprocess
+import time
+from pathlib import Path
+from importlib.resources import files
+from loguru import logger
+import numpy as np
+import pandas as pd
+from colabdesign import mk_afdesign_model, clear_mem
+from colabdesign.shared.utils import copy_dict
+from freebindcraft.functions.biopython_utils import (
+    calc_ss_percentage,
+    calculate_clash_score,
+    clear_dssp_cache,
+    target_pdb_rmsd,
+    validate_design_sequence,
+)
+from freebindcraft.functions.colabdesign_utils import (
+    binder_hallucination,
+    mpnn_gen_sequence,
+    predict_binder_alone,
+    predict_binder_complex,
+)
+from freebindcraft.functions.generic_utils import (
+    calculate_averages,
+    check_accepted_designs,
+    check_filters,
+    check_jax_gpu,
+    check_n_trajectories,
+    create_dataframe,
+    generate_dataframe_labels,
+    generate_directories,
+    generate_filter_pass_csv,
+    insert_data,
+    load_af2_models,
+    load_helicity,
+    load_json_settings,
+    migrate_csv_columns,
+    perform_advanced_settings_check,
+    perform_input_check,
+    save_fasta,
+)
+from freebindcraft.functions.pyrosetta_utils import (
+    PYROSETTA_AVAILABLE,
+    pr,
+    pr_relax,
+    score_interface,
+    unaligned_rmsd,
+)
+from loguru import logger
+
 try:
     import resource  # POSIX-only; used to raise RLIMIT_NOFILE (ulimit -n)
 except Exception:
     resource = None
 
+ASSETS_ROOT = files("freebindcraft") / "assets"
+SETTINGS_ROOT = ASSETS_ROOT / "settings_advanced"
+FILTERS_ROOT = ASSETS_ROOT / "settings_filters"
+AVAILABLE_SETTINGS = list(SETTINGS_ROOT.glob("*json"))
+AVAILABLE_FILTERS = list(FILTERS_ROOT.glob("*json"))
+
+
 def _bump_open_files_limit(min_soft=65536):
     """Attempt to raise the soft RLIMIT_NOFILE up to min_soft (not above hard)."""
     if resource is None:
-        print("Warning: 'resource' module not available; cannot adjust open files limit.")
+        logger.warning("'resource' module not available; cannot adjust open files limit.")
         return
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        desired_soft = min(max(soft, int(min_soft)), hard if hard != resource.RLIM_INFINITY else max(soft, int(min_soft)))
+        desired_soft = min(max(soft, int(min_soft)),
+                           hard if hard != resource.RLIM_INFINITY else max(soft, int(min_soft)))
         if desired_soft > soft:
             resource.setrlimit(resource.RLIMIT_NOFILE, (desired_soft, hard))
-            print(f"Adjusted open files soft limit: {soft} -> {desired_soft} (hard={hard})")
+            logger.info(f"Adjusted open files soft limit: {soft} -> {desired_soft} (hard={hard})")
         else:
-            print(f"Open files limits OK (soft={soft}, hard={hard})")
+            logger.debug(f"Open files limits OK (soft={soft}, hard={hard})")
     except Exception as e:
-        print(f"Warning: Unable to adjust open files limit: {e}")
+        logger.warning(f"Unable to adjust open files limit: {e}")
+
 
 # Raise file descriptor soft limit early to avoid 'Too many open files'
 _bump_open_files_limit(min_soft=65536)
+
 
 # Defer GPU availability check until after CLI/interactive handling
 
@@ -40,14 +94,14 @@ def ensure_binaries_executable(use_pyrosetta=True):
     """Ensure all required binaries in functions/ are executable."""
     bindcraft_folder = os.path.dirname(os.path.realpath(__file__))
     functions_dir = os.path.join(bindcraft_folder, "functions")
-    
+
     # Always needed binaries
     binaries = ["dssp", "sc", "FASPR"]
-    
+
     # Only add DAlphaBall.gcc if using PyRosetta
     if use_pyrosetta:
         binaries.append("DAlphaBall.gcc")
-    
+
     for binary in binaries:
         binary_path = os.path.join(functions_dir, binary)
         if os.path.isfile(binary_path):
@@ -57,23 +111,27 @@ def ensure_binaries_executable(use_pyrosetta=True):
                     # Make executable
                     current_mode = os.stat(binary_path).st_mode
                     os.chmod(binary_path, current_mode | 0o755)
-                    print(f"Made {binary} executable")
+                    logger.debug(f"Made {binary} executable")
             except Exception as e:
-                print(f"Warning: Failed to make {binary} executable: {e}")
+                logger.warning(f"Failed to make {binary} executable: {e}")
+
 
 # Ensure binaries are executable at startup (will be called again with proper use_pyrosetta flag later)
 ensure_binaries_executable()
 
 ######################################
 ### parse input paths and interactive mode
-parser = argparse.ArgumentParser(description='Script to run BindCraft binder design.')
+parser = argparse.ArgumentParser(
+    description='Script to run BindCraft binder design.',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
 
 parser.add_argument('--settings', '-s', type=str, required=False,
                     help='Path to the basic settings.json file. If omitted in a TTY, interactive mode is used.')
-parser.add_argument('--filters', '-f', type=str, default='./settings_filters/default_filters.json',
-                    help='Path to the filters.json file used to filter design. If not provided, default will be used.')
-parser.add_argument('--advanced', '-a', type=str, default='./settings_advanced/default_4stage_multimer.json',
-                    help='Path to the advanced.json file with additional design settings. If not provided, default will be used.')
+parser.add_argument('--filters', '-f', type=str, default=FILTERS_ROOT / 'default_filters.json',
+                    help='Path to the filters.json file used to filter design.')
+parser.add_argument('--advanced', '-a', type=str, default=SETTINGS_ROOT / 'default_4stage_multimer.json',
+                    help='Path to the advanced.json file with additional design settings.')
 parser.add_argument('--no-pyrosetta', action='store_true',
                     help='Run without PyRosetta (skips relaxation and PyRosetta-based scoring)')
 parser.add_argument('--verbose', action='store_true',
@@ -88,9 +146,12 @@ parser.add_argument('--interactive', action='store_true',
                     help='Force interactive mode to collect target settings and options')
 parser.add_argument('--rank-by', type=str, default='i_pTM',
                     choices=['i_pTM', 'ipSAE'],
-                    help='Metric to rank final designs by (default: i_pTM)')
+                    help='Metric to rank final designs by')
+parser.add_argument('--params-dir', type=str, default=None,
+                    help='Path to the AlphaFold2 model parameters directory. Overrides the af_params_dir value set in the advanced settings JSON.')
 
 args = parser.parse_args()
+
 
 def _isatty_stdin():
     try:
@@ -98,11 +159,13 @@ def _isatty_stdin():
     except Exception:
         return False
 
+
 def _input_with_default(prompt_text, default_value=None):
     if default_value is None:
         return input(prompt_text).strip()
     resp = input(f"{prompt_text} ").strip()
     return resp if resp else default_value
+
 
 def _yes_no(prompt_text, default_yes=False):
     default_hint = 'Y/n' if default_yes else 'y/N'
@@ -110,6 +173,7 @@ def _yes_no(prompt_text, default_yes=False):
     if resp == '':
         return default_yes
     return resp in ('y', 'yes')
+
 
 def _list_json_choices(folder_path):
     try:
@@ -120,52 +184,60 @@ def _list_json_choices(folder_path):
     # return list of (display_name_without_ext, abspath)
     return [(os.path.splitext(f)[0], os.path.join(folder_path, f)) for f in entries]
 
+
 def _prompt_interactive_and_prepare_args(args):
     base_dir = os.path.dirname(os.path.realpath(__file__))
     filters_dir = os.path.join(base_dir, 'settings_filters')
     advanced_dir = os.path.join(base_dir, 'settings_advanced')
 
-    print("\nBindCraft Interactive Setup\n")
+    logger.info("\nBindCraft Interactive Setup\n")
 
     while True:
         # Design type selection
-        print("Design type:")
-        print("1. Miniprotein (31+ aa)")
-        print("2. Peptide (8-30 aa)")
+        logger.info("Design type:")
+        logger.info("1. Miniprotein (31+ aa)")
+        logger.info("2. Peptide (8-30 aa)")
         dtype_choice = _input_with_default("Choose design type (press Enter for Miniprotein):", "")
         is_peptide = (dtype_choice.strip() == '2')
 
         # Required inputs
         project_name = _input_with_default("Enter project/binder name:", None)
         while not project_name:
-            print("Project name is required.")
+            logger.info("Project name is required.")
             project_name = _input_with_default("Enter project/binder name:", None)
 
         # Require a valid existing PDB file path; re-prompt until valid
         while True:
             pdb_raw = _input_with_default("Enter path to PDB file:", None)
             if not pdb_raw:
-                print("PDB path is required.")
+                logger.info("PDB path is required.")
                 continue
             candidate = os.path.abspath(os.path.expanduser(pdb_raw))
             if os.path.isfile(candidate):
                 pdb_path = candidate
                 break
-            print(f"Error: No PDB file found at '{candidate}'. Please re-enter.")
+            logger.info(f"Error: No PDB file found at '{candidate}'. Please re-enter.")
 
-        output_dir = _input_with_default("Enter output directory:", os.path.join(os.getcwd(), f"{project_name}_bindcraft_out"))
+        output_dir = _input_with_default("Enter output directory:",
+                                         os.path.join(os.getcwd(), f"{project_name}_bindcraft_out"))
         output_dir = os.path.abspath(os.path.expanduser(output_dir))
         os.makedirs(output_dir, exist_ok=True)
 
         chains = _input_with_default("Enter target chains (e.g., A or A,B):", "A")
-        hotspots = _input_with_default("Enter hotspot residue(s) for BindCraft to target. Use format: chain letter + residue numbers (e.g., 'A1,B20-25'). Leave empty for no preference:", "")
+        hotspots = _input_with_default(
+            "Enter hotspot residue(s) for BindCraft to target. Use format: chain letter + residue numbers (e.g., 'A1,B20-25'). Leave empty for no preference:",
+            "")
 
         if is_peptide:
             lengths_prompt_default = "8 25"
-            lengths_input = _input_with_default("Enter peptide min and max lengths (8-30) separated by space or comma (default 8 25):", lengths_prompt_default)
+            lengths_input = _input_with_default(
+                "Enter peptide min and max lengths (8-30) separated by space or comma (default 8 25):",
+                lengths_prompt_default)
         else:
             lengths_prompt_default = "65 150"
-            lengths_input = _input_with_default("Enter miniprotein min and max lengths separated by space or comma (min>=31, default 65 150):", lengths_prompt_default)
+            lengths_input = _input_with_default(
+                "Enter miniprotein min and max lengths separated by space or comma (min>=31, default 65 150):",
+                lengths_prompt_default)
         try:
             normalized = lengths_input.replace(',', ' ').split()
             min_len_val, max_len_val = int(normalized[0]), int(normalized[1])
@@ -195,7 +267,7 @@ def _prompt_interactive_and_prepare_args(args):
             num_designs = 100
 
         # List choices
-        print("\nAvailable filter settings:")
+        logger.info("\nAvailable filter settings:")
         filter_choices_all = _list_json_choices(filters_dir)
         name_to_filter = {name: path for name, path in filter_choices_all}
         if is_peptide:
@@ -206,18 +278,20 @@ def _prompt_interactive_and_prepare_args(args):
             default_filter_name = 'default_filters'
         ordered_filters = [(name, name_to_filter[name]) for name in filter_order if name in name_to_filter]
         for i, (name, _) in enumerate(ordered_filters, 1):
-            print(f"{i}. {name}")
+            logger.info(f"{i}. {name}")
         filter_idx = _input_with_default(f"Choose filter (press Enter for {default_filter_name}):", "")
         if filter_idx:
             try:
                 filter_idx_int = int(filter_idx)
                 selected_filter = ordered_filters[filter_idx_int - 1][1]
             except Exception:
-                selected_filter = name_to_filter.get(default_filter_name, os.path.join(filters_dir, f"{default_filter_name}.json"))
+                selected_filter = name_to_filter.get(default_filter_name,
+                                                     os.path.join(filters_dir, f"{default_filter_name}.json"))
         else:
-            selected_filter = name_to_filter.get(default_filter_name, os.path.join(filters_dir, f"{default_filter_name}.json"))
+            selected_filter = name_to_filter.get(default_filter_name,
+                                                 os.path.join(filters_dir, f"{default_filter_name}.json"))
 
-        print("\nAvailable advanced settings:")
+        logger.info("\nAvailable advanced settings:")
         advanced_choices_all = _list_json_choices(advanced_dir)
         name_to_adv = {name: path for name, path in advanced_choices_all}
         if is_peptide:
@@ -250,32 +324,34 @@ def _prompt_interactive_and_prepare_args(args):
             default_adv_name = 'default_4stage_multimer'
         ordered_adv = [(name, name_to_adv[name]) for name in adv_order if name in name_to_adv]
         for i, (name, _) in enumerate(ordered_adv, 1):
-            print(f"{i}. {name}")
+            logger.info(f"{i}. {name}")
         advanced_idx = _input_with_default(f"Choose advanced (press Enter for {default_adv_name}):", "")
         if advanced_idx:
             try:
                 advanced_idx_int = int(advanced_idx)
                 selected_advanced = ordered_adv[advanced_idx_int - 1][1]
             except Exception:
-                selected_advanced = name_to_adv.get(default_adv_name, os.path.join(advanced_dir, f"{default_adv_name}.json"))
+                selected_advanced = name_to_adv.get(default_adv_name,
+                                                    os.path.join(advanced_dir, f"{default_adv_name}.json"))
         else:
-            selected_advanced = name_to_adv.get(default_adv_name, os.path.join(advanced_dir, f"{default_adv_name}.json"))
+            selected_advanced = name_to_adv.get(default_adv_name,
+                                                os.path.join(advanced_dir, f"{default_adv_name}.json"))
 
         # Toggles
         verbose = _yes_no("Enable verbose output?", default_yes=False)
         plots_on = _yes_no("Enable saving plots?", default_yes=True)
         animations_on = _yes_no("Enable saving animations?", default_yes=True)
         run_with_pyrosetta = _yes_no("Run with PyRosetta?", default_yes=True)
-        
+
         # Only ask about debug PDbs if not using PyRosetta (since debug PDbs are for OpenMM relax)
         debug_pdbs = False
         if not run_with_pyrosetta:
             debug_pdbs = _yes_no("Write intermediate debug PDBs during OpenMM relax?", default_yes=False)
 
         # Ranking method selection
-        print("\nRanking method for final designs:")
-        print("1. i_pTM (interface predicted TM-score)")
-        print("2. ipSAE (interface predicted Structural Alignment Error)")
+        logger.info("\nRanking method for final designs:")
+        logger.info("1. i_pTM (interface predicted TM-score)")
+        logger.info("2. ipSAE (interface predicted Structural Alignment Error)")
         rank_choice = _input_with_default("Choose ranking method (press Enter for i_pTM):", "")
         if rank_choice.strip() == '2':
             rank_by_metric = 'ipSAE'
@@ -283,29 +359,29 @@ def _prompt_interactive_and_prepare_args(args):
             rank_by_metric = 'i_pTM'
 
         # Summary for confirmation
-        print("\nConfiguration Summary:")
-        print(f"Project Name: {project_name}")
-        print(f"PDB File: {pdb_path}")
-        print(f"Output Directory: {output_dir}")
-        print(f"Chains: {chains}")
-        print(f"Hotspots: {hotspots if hotspots else 'None'}")
-        print(f"Length Range: {lengths}")
-        print(f"Design Type: {'Peptide' if is_peptide else 'Miniprotein'}")
-        print(f"Number of Final Designs: {num_designs}")
-        print(f"Filter Setting: {os.path.splitext(os.path.basename(selected_filter))[0]}")
-        print(f"Advanced Setting: {os.path.splitext(os.path.basename(selected_advanced))[0]}")
-        print(f"Verbose: {'Yes' if verbose else 'No'}")
+        logger.info("\nConfiguration Summary:")
+        logger.info(f"Project Name: {project_name}")
+        logger.info(f"PDB File: {pdb_path}")
+        logger.info(f"Output Directory: {output_dir}")
+        logger.info(f"Chains: {chains}")
+        logger.info(f"Hotspots: {hotspots if hotspots else 'None'}")
+        logger.info(f"Length Range: {lengths}")
+        logger.info(f"Design Type: {'Peptide' if is_peptide else 'Miniprotein'}")
+        logger.info(f"Number of Final Designs: {num_designs}")
+        logger.info(f"Filter Setting: {os.path.splitext(os.path.basename(selected_filter))[0]}")
+        logger.info(f"Advanced Setting: {os.path.splitext(os.path.basename(selected_advanced))[0]}")
+        logger.info(f"Verbose: {'Yes' if verbose else 'No'}")
         if not run_with_pyrosetta:
-            print(f"Debug PDbs: {'Yes' if debug_pdbs else 'No'}")
-        print(f"Plots: {'On' if plots_on else 'Off'}")
-        print(f"Animations: {'On' if animations_on else 'Off'}")
-        print(f"PyRosetta: {'On' if run_with_pyrosetta else 'Off'}")
-        print(f"Ranking Method: {rank_by_metric}")
+            logger.info(f"Debug PDbs: {'Yes' if debug_pdbs else 'No'}")
+        logger.info(f"Plots: {'On' if plots_on else 'Off'}")
+        logger.info(f"Animations: {'On' if animations_on else 'Off'}")
+        logger.info(f"PyRosetta: {'On' if run_with_pyrosetta else 'Off'}")
+        logger.info(f"Ranking Method: {rank_by_metric}")
 
         if _yes_no("Proceed with these settings?", default_yes=True):
             break
         else:
-            print("Let's re-enter the details.\n")
+            logger.info("Let's re-enter the details.\n")
 
     # Prepare target settings JSON
     target_settings = {
@@ -325,7 +401,7 @@ def _prompt_interactive_and_prepare_args(args):
         with open(settings_path_out, 'w') as f:
             json.dump(target_settings, f, indent=2)
     except Exception as e:
-        print(f"Error writing settings JSON: {e}")
+        logger.error(f"Error writing settings JSON: {e}")
         sys.exit(1)
 
     # Map to args
@@ -341,32 +417,33 @@ def _prompt_interactive_and_prepare_args(args):
 
     return args
 
+
 # Enter interactive mode if requested or if no settings were provided in a TTY
 if args.interactive or (not args.settings and _isatty_stdin()):
     args = _prompt_interactive_and_prepare_args(args)
 elif not args.settings and not _isatty_stdin():
     # No TTY and no settings -> cannot prompt
-    print("Error: --settings is required in non-interactive environments.")
+    logger.error("--settings is required in non-interactive environments.")
     sys.exit(1)
 
 # perform checks of input setting files
 settings_path, filters_path, advanced_path = perform_input_check(args)
 
-# Configure standard logging based on --verbose
-logging.basicConfig(
-    level=logging.WARNING,
-    format='%(asctime)s %(levelname)s %(name)s: %(message)s'
-)
+# Configure loguru: stdout sink + file sink next to the settings file
+_log_level = "DEBUG" if args.verbose else "INFO"
+_log_file = Path(settings_path).parent / f"{Path(settings_path).stem}_bindcraft.log"
 
-# Reduce noise from third-party libraries regardless of verbosity
-for noisy_logger in (
-    "jax", "jaxlib", "jax._src", "absl", "flax", "colabdesign", "tensorflow", "xla"):
-    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+logger.remove()  # remove the default stderr sink
+logger.add(sys.stdout, level=_log_level, colorize=True,
+           format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
+logger.add(_log_file, level="DEBUG", rotation="50 MB", retention=3,
+           format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}")
+logger.info(f"Logging to {_log_file}")
 
-# Enable detailed logs only for our modules when --verbose is set
-if args.verbose:
-    logging.getLogger("functions").setLevel(logging.DEBUG)
-    logging.getLogger("bindcraft").setLevel(logging.DEBUG)
+# Suppress noisy third-party loggers (standard logging bridge)
+import logging as _logging
+for _noisy in ("jax", "jaxlib", "jax._src", "absl", "flax", "colabdesign", "tensorflow", "xla"):
+    _logging.getLogger(_noisy).setLevel(_logging.WARNING)
 
 # Check if JAX-capable GPU is available, otherwise exit (after interactive/container handling)
 check_jax_gpu()
@@ -398,6 +475,8 @@ if args.no_plots:
     advanced_settings["save_design_trajectory_plots"] = False
 if args.no_animations:
     advanced_settings["save_design_animations"] = False
+if args.params_dir:
+    advanced_settings["af_params_dir"] = args.params_dir
 
 ### generate directories, design path names can be found within the function
 design_paths = generate_directories(target_settings["design_path"])
@@ -411,7 +490,7 @@ final_csv = os.path.join(target_settings["design_path"], 'final_design_stats.csv
 failure_csv = os.path.join(target_settings["design_path"], 'failure_csv.csv')
 
 # Migrate existing CSVs to include new columns (backwards compatibility for resumed jobs)
-from functions.generic_utils import migrate_csv_columns
+
 migrate_csv_columns(trajectory_csv, trajectory_labels)
 migrate_csv_columns(mpnn_csv, design_labels)
 migrate_csv_columns(final_csv, final_labels)
@@ -426,17 +505,17 @@ generate_filter_pass_csv(failure_csv, args.filters)
 if not os.path.exists(failure_csv):
     # This should ideally not happen if generate_filter_pass_csv worked, create an empty one if it's missing.
     temp_failure_df_for_cols = pd.DataFrame()
-    print(f"Warning: {failure_csv} was not found after generate_filter_pass_csv. rejected_mpnn_full_stats.csv might have incorrect filter columns.")
+    logger.warning(f"{failure_csv} was not found after generate_filter_pass_csv. rejected_mpnn_full_stats.csv might have incorrect filter columns.")
 else:
     try:
         temp_failure_df_for_cols = pd.read_csv(failure_csv)
     except pd.errors.EmptyDataError:
         # If failure_csv is empty we need to get column names from how generate_filter_pass_csv would create them.
-        print(f"Warning: {failure_csv} is empty. rejected_mpnn_full_stats.csv may lack detailed filter columns initially if no filters are defined or an issue occurred.")
-        temp_failure_df_for_cols = pd.DataFrame() # Fallback- we don't want BindCraft to crash over this
+        logger.warning(f"{failure_csv} is empty. rejected_mpnn_full_stats.csv may lack detailed filter columns initially if no filters are defined or an issue occurred.")
+        temp_failure_df_for_cols = pd.DataFrame()  # Fallback- we don't want BindCraft to crash over this
 
 filter_column_names_for_rejected_log = temp_failure_df_for_cols.columns.tolist()
-del temp_failure_df_for_cols # Free memory
+del temp_failure_df_for_cols  # Free memory
 
 rejected_stats_columns = ['Design', 'Sequence'] + filter_column_names_for_rejected_log
 rejected_mpnn_full_stats_csv = os.path.join(target_settings["design_path"], 'rejected_mpnn_full_stats.csv')
@@ -449,25 +528,26 @@ use_pyrosetta = False
 
 if args.no_pyrosetta:
     # Quiet when user explicitly disables PyRosetta
-    print("Running in PyRosetta-free mode as requested by --no-pyrosetta flag.")
+    logger.info("Running in PyRosetta-free mode as requested by --no-pyrosetta flag.")
 else:
     if 'PYROSETTA_AVAILABLE' in globals() and PYROSETTA_AVAILABLE and pr is not None:
         try:
-            pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
-            print("PyRosetta initialized successfully.")
+            pr.init(
+                f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
+            logger.info("PyRosetta initialized successfully.")
             use_pyrosetta = True
         except Exception as e:
-            print(f"PyRosetta detected but failed to initialize: {e}")
-            print("Falling back to OpenMM and Biopython routines.")
+            logger.warning(f"PyRosetta detected but failed to initialize: {e}")
+            logger.warning("Falling back to OpenMM and Biopython routines.")
     else:
-        print("PyRosetta not found. Using OpenMM and Biopython routines.")
+        logger.info("PyRosetta not found. Using OpenMM and Biopython routines.")
 
 # Ensure binaries are executable with correct PyRosetta mode
 ensure_binaries_executable(use_pyrosetta=use_pyrosetta)
 
-print(f"Running binder design for target {settings_file}")
-print(f"Design settings used: {advanced_file}")
-print(f"Filtering designs based on {filters_file}")
+logger.info(f"Running binder design for target {settings_file}")
+logger.info(f"Design settings used: {advanced_file}")
+logger.info(f"Filtering designs based on {filters_file}")
 
 ####################################
 # initialise counters
@@ -480,7 +560,8 @@ while True:
     ### check if we have the target number of binders
     # Map CLI metric name to CSV column name (e.g., 'i_pTM' -> 'Average_i_pTM')
     rank_by_column = f"Average_{args.rank_by}"
-    final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels, rank_by=rank_by_column)
+    final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings,
+                                                   target_settings, design_labels, rank_by=rank_by_column)
 
     if final_designs_reached:
         # stop design loop execution
@@ -507,18 +588,20 @@ while True:
     helicity_value = load_helicity(advanced_settings)
 
     # generate design name and check if same trajectory was already run
-    design_name = target_settings["binder_name"] + "_l" + str(length) + "_s"+ str(seed)
+    design_name = target_settings["binder_name"] + "_l" + str(length) + "_s" + str(seed)
     trajectory_dirs = ["Trajectory", "Trajectory/Relaxed", "Trajectory/LowConfidence", "Trajectory/Clashing"]
-    trajectory_exists = any(os.path.exists(os.path.join(design_paths[trajectory_dir], design_name + ".pdb")) for trajectory_dir in trajectory_dirs)
+    trajectory_exists = any(
+        os.path.exists(os.path.join(design_paths[trajectory_dir], design_name + ".pdb")) for trajectory_dir in
+        trajectory_dirs)
 
     if not trajectory_exists:
-        print("Starting trajectory: "+design_name)
+        logger.info(f"Starting trajectory: {design_name}")
 
         ### Begin binder hallucination
         trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings["chains"],
-                                            target_settings["target_hotspot_residues"], length, seed, helicity_value,
-                                            design_models, advanced_settings, design_paths, failure_csv)
-        trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
+                                          target_settings["target_hotspot_residues"], length, seed, helicity_value,
+                                          design_models, advanced_settings, design_paths, failure_csv)
+        trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"])  # contains plddt, ptm, i_ptm, pae, i_pae
         trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
 
         # round the metrics to two decimal places
@@ -527,8 +610,7 @@ while True:
         # time trajectory
         trajectory_time = time.time() - trajectory_start_time
         trajectory_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(trajectory_time // 3600), int((trajectory_time % 3600) // 60), int(trajectory_time % 60))}"
-        print("Starting trajectory took: "+trajectory_time_text)
-        print("")
+        logger.info(f"Starting trajectory took: {trajectory_time_text}")
 
         # Proceed if there is no trajectory termination signal
         if trajectory.aux["log"]["terminate"] == "":
@@ -544,10 +626,12 @@ while True:
             num_clashes_relaxed = calculate_clash_score(trajectory_relaxed)
 
             # secondary structure content of starting trajectory binder and interface
-            trajectory_alpha, trajectory_beta, trajectory_loops, trajectory_alpha_interface, trajectory_beta_interface, trajectory_loops_interface, trajectory_i_plddt, trajectory_ss_plddt = calc_ss_percentage(trajectory_pdb, advanced_settings, binder_chain)
+            trajectory_alpha, trajectory_beta, trajectory_loops, trajectory_alpha_interface, trajectory_beta_interface, trajectory_loops_interface, trajectory_i_plddt, trajectory_ss_plddt = calc_ss_percentage(
+                trajectory_pdb, advanced_settings, binder_chain)
 
             # analyze interface scores for relaxed af2 trajectory
-            trajectory_interface_scores, trajectory_interface_AA, trajectory_interface_residues = score_interface(trajectory_relaxed, binder_chain, use_pyrosetta=use_pyrosetta)
+            trajectory_interface_scores, trajectory_interface_AA, trajectory_interface_residues = score_interface(
+                trajectory_relaxed, binder_chain, use_pyrosetta=use_pyrosetta)
 
             # starting binder sequence
             trajectory_sequence = trajectory.get_seq(get_best=True)[0]
@@ -556,26 +640,42 @@ while True:
             traj_seq_notes = validate_design_sequence(trajectory_sequence, num_clashes_relaxed, advanced_settings)
 
             # target structure RMSD compared to input PDB
-            trajectory_target_rmsd = target_pdb_rmsd(trajectory_pdb, target_settings["starting_pdb"], target_settings["chains"])
+            trajectory_target_rmsd = target_pdb_rmsd(trajectory_pdb, target_settings["starting_pdb"],
+                                                     target_settings["chains"])
 
             # save trajectory statistics into CSV
-            trajectory_data = [design_name, advanced_settings["design_algorithm"], length, seed, helicity_value, target_settings["target_hotspot_residues"], trajectory_sequence, trajectory_interface_residues, 
-                                trajectory_metrics['plddt'], trajectory_metrics['ptm'], trajectory_metrics['i_ptm'], trajectory_metrics['pae'], trajectory_metrics['i_pae'],
-                                trajectory_metrics.get('ipSAE', None),
-                                trajectory_i_plddt, trajectory_ss_plddt, num_clashes_trajectory, num_clashes_relaxed, trajectory_interface_scores['binder_score'],
-                                trajectory_interface_scores['surface_hydrophobicity'], trajectory_interface_scores['interface_sc'], trajectory_interface_scores['interface_packstat'],
-                                trajectory_interface_scores['interface_dG'], trajectory_interface_scores['interface_dSASA'], trajectory_interface_scores['interface_dG_SASA_ratio'],
-                                trajectory_interface_scores['interface_fraction'], trajectory_interface_scores['interface_hydrophobicity'], trajectory_interface_scores['interface_nres'], trajectory_interface_scores['interface_interface_hbonds'],
-                                trajectory_interface_scores['interface_hbond_percentage'], trajectory_interface_scores['interface_delta_unsat_hbonds'], trajectory_interface_scores['interface_delta_unsat_hbonds_percentage'],
-                                trajectory_alpha_interface, trajectory_beta_interface, trajectory_loops_interface, trajectory_alpha, trajectory_beta, trajectory_loops, trajectory_interface_AA, trajectory_target_rmsd, 
-                                trajectory_time_text, traj_seq_notes, settings_file, filters_file, advanced_file]
+            trajectory_data = [design_name, advanced_settings["design_algorithm"], length, seed, helicity_value,
+                               target_settings["target_hotspot_residues"], trajectory_sequence,
+                               trajectory_interface_residues,
+                               trajectory_metrics['plddt'], trajectory_metrics['ptm'], trajectory_metrics['i_ptm'],
+                               trajectory_metrics['pae'], trajectory_metrics['i_pae'],
+                               trajectory_metrics.get('ipSAE', None),
+                               trajectory_i_plddt, trajectory_ss_plddt, num_clashes_trajectory, num_clashes_relaxed,
+                               trajectory_interface_scores['binder_score'],
+                               trajectory_interface_scores['surface_hydrophobicity'],
+                               trajectory_interface_scores['interface_sc'],
+                               trajectory_interface_scores['interface_packstat'],
+                               trajectory_interface_scores['interface_dG'],
+                               trajectory_interface_scores['interface_dSASA'],
+                               trajectory_interface_scores['interface_dG_SASA_ratio'],
+                               trajectory_interface_scores['interface_fraction'],
+                               trajectory_interface_scores['interface_hydrophobicity'],
+                               trajectory_interface_scores['interface_nres'],
+                               trajectory_interface_scores['interface_interface_hbonds'],
+                               trajectory_interface_scores['interface_hbond_percentage'],
+                               trajectory_interface_scores['interface_delta_unsat_hbonds'],
+                               trajectory_interface_scores['interface_delta_unsat_hbonds_percentage'],
+                               trajectory_alpha_interface, trajectory_beta_interface, trajectory_loops_interface,
+                               trajectory_alpha, trajectory_beta, trajectory_loops, trajectory_interface_AA,
+                               trajectory_target_rmsd,
+                               trajectory_time_text, traj_seq_notes, settings_file, filters_file, advanced_file]
             insert_data(trajectory_csv, trajectory_data)
 
             # Skip MPNN optimization if no interface residues (no hotspot contact)
             if not trajectory_interface_residues:
-                print(f"No interface residues found for {design_name}, skipping MPNN optimization")
+                logger.warning(f"No interface residues found for {design_name}, skipping MPNN optimization")
                 continue
-            
+
             if advanced_settings["enable_mpnn"]:
                 # initialise MPNN counters
                 mpnn_n = 1
@@ -584,8 +684,9 @@ while True:
                 design_start_time = time.time()
 
                 ### MPNN redesign of starting binder
-                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
-                
+                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues,
+                                                      advanced_settings)
+
                 existing_mpnn_sequences = set()
                 if os.path.exists(mpnn_csv) and os.path.getsize(mpnn_csv) > 0:
                     try:
@@ -593,29 +694,31 @@ while True:
                         if not df_mpnn.empty:
                             existing_mpnn_sequences = set(df_mpnn['Sequence'].dropna().astype(str).values)
                     except pd.errors.EmptyDataError:
-                        print(f"Warning: {mpnn_csv} is empty or has no columns. Starting with no existing MPNN sequences.")
+                        logger.warning(f"{mpnn_csv} is empty or has no columns. Starting with no existing MPNN sequences.")
                     except KeyError:
-                        print(f"Warning: 'Sequence' column not found in {mpnn_csv}. Starting with no existing MPNN sequences.")
+                        logger.warning(f"'Sequence' column not found in {mpnn_csv}. Starting with no existing MPNN sequences.")
                     except Exception as e:
-                        print(f"Warning: Could not read existing MPNN sequences from {mpnn_csv} due to: {e}. Starting with no existing MPNN sequences.")
+                        logger.warning(f"Could not read existing MPNN sequences from {mpnn_csv} due to: {e}. Starting with no existing MPNN sequences.")
                 else:
-                    print(f"Info: {mpnn_csv} does not exist or is empty. Starting with no existing MPNN sequences.")
+                    logger.info(f"{mpnn_csv} does not exist or is empty. Starting with no existing MPNN sequences.")
 
                 # create set of MPNN sequences with allowed amino acid composition
-                restricted_AAs = set(aa.strip().upper() for aa in advanced_settings["omit_AAs"].split(',')) if advanced_settings["force_reject_AA"] else set()
+                restricted_AAs = set(aa.strip().upper() for aa in advanced_settings["omit_AAs"].split(',')) if \
+                    advanced_settings["force_reject_AA"] else set()
 
                 mpnn_sequences = sorted({
-                    mpnn_trajectories['seq'][n][-length:]: {
-                        'seq': mpnn_trajectories['seq'][n][-length:],
-                        'score': mpnn_trajectories['score'][n],
-                        'seqid': mpnn_trajectories['seqid'][n]
-                    } for n in range(advanced_settings["num_seqs"])
-                    if (not restricted_AAs or not any(aa in mpnn_trajectories['seq'][n][-length:].upper() for aa in restricted_AAs))
-                    and mpnn_trajectories['seq'][n][-length:] not in existing_mpnn_sequences
-                }.values(), key=lambda x: x['score'])
+                                            mpnn_trajectories['seq'][n][-length:]: {
+                                                'seq': mpnn_trajectories['seq'][n][-length:],
+                                                'score': mpnn_trajectories['score'][n],
+                                                'seqid': mpnn_trajectories['seqid'][n]
+                                            } for n in range(advanced_settings["num_seqs"])
+                                            if (not restricted_AAs or not any(
+                        aa in mpnn_trajectories['seq'][n][-length:].upper() for aa in restricted_AAs))
+                                               and mpnn_trajectories['seq'][n][-length:] not in existing_mpnn_sequences
+                                        }.values(), key=lambda x: x['score'])
 
                 del existing_mpnn_sequences
-  
+
                 # check whether any sequences are left after amino acid rejection and duplication check, and if yes proceed with prediction
                 if mpnn_sequences:
                     # add optimisation for increasing recycles if trajectory is beta sheeted
@@ -625,19 +728,33 @@ while True:
                     ### Compile prediction models once for faster prediction of MPNN sequences
                     clear_mem()
                     # compile complex prediction model
-                    complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
-                                                                use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
+                    complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings[
+                        "num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
+                                                                 use_multimer=multimer_validation,
+                                                                 use_initial_guess=advanced_settings[
+                                                                     "predict_initial_guess"],
+                                                                 use_initial_atom_pos=advanced_settings[
+                                                                     "predict_bigbang"])
                     if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-                        complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                            rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
+                        complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B',
+                                                             binder_len=length, use_binder_template=True,
+                                                             rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                             rm_target_sc=advanced_settings["rm_template_sc_predict"],
+                                                             rm_template_ic=True)
                     else:
-                        complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                            rm_target_sc=advanced_settings["rm_template_sc_predict"])
+                        complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"],
+                                                             chain=target_settings["chains"], binder_len=length,
+                                                             rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                             rm_target_sc=advanced_settings["rm_template_sc_predict"])
 
                     # compile binder monomer prediction model
-                    binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False, initial_guess=False, 
-                                                                use_initial_atom_pos=False, num_recycles=advanced_settings["num_recycles_validation"], 
-                                                                data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
+                    binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False,
+                                                                initial_guess=False,
+                                                                use_initial_atom_pos=False,
+                                                                num_recycles=advanced_settings[
+                                                                    "num_recycles_validation"],
+                                                                data_dir=advanced_settings["af_params_dir"],
+                                                                use_multimer=multimer_validation)
                     binder_prediction_model.prep_inputs(length=length)
 
                     # iterate over designed sequences        
@@ -646,41 +763,44 @@ while True:
 
                         # generate mpnn design name numbering
                         mpnn_design_name = design_name + "_mpnn" + str(mpnn_n)
-                        mpnn_score = round(mpnn_sequence['score'],2)
-                        mpnn_seqid = round(mpnn_sequence['seqid'],2)
+                        mpnn_score = round(mpnn_sequence['score'], 2)
+                        mpnn_seqid = round(mpnn_sequence['seqid'], 2)
 
                         # add design to dictionary
-                        mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score, 'seqid': mpnn_seqid}
+                        mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score,
+                                                       'seqid': mpnn_seqid}
 
                         # save fasta sequence
                         if advanced_settings["save_mpnn_fasta"] is True:
                             save_fasta(mpnn_design_name, mpnn_sequence['seq'], design_paths)
-                        
+
                         ### Predict mpnn redesigned binder complex using masked templates
-                        mpnn_complex_statistics, pass_af2_filters, early_filter_details = predict_binder_complex(complex_prediction_model,
-                                                                                        mpnn_sequence['seq'], mpnn_design_name,
-                                                                                        target_settings["starting_pdb"], target_settings["chains"],
-                                                                                        length, trajectory_pdb, prediction_models, advanced_settings,
-                                                                                        filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
+                        mpnn_complex_statistics, pass_af2_filters, early_filter_details = predict_binder_complex(
+                            complex_prediction_model,
+                            mpnn_sequence['seq'], mpnn_design_name,
+                            target_settings["starting_pdb"], target_settings["chains"],
+                            length, trajectory_pdb, prediction_models, advanced_settings,
+                            filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
 
                         # if AF2 filters are not passed then skip the scoring but log the failure
                         if not pass_af2_filters:
-                            print(f"Base AF2 filters not passed for {mpnn_design_name}, skipping full interface scoring.")
+                            logger.warning(f"Base AF2 filters not passed for {mpnn_design_name}, skipping full interface scoring.")
 
                             # Log to rejected_mpnn_full_stats.csv for early AF2 failures
                             rejected_data_list_for_csv = [mpnn_design_name, mpnn_sequence['seq']]
-                            
+
                             failed_base_metrics_for_this_design = set()
-                            if early_filter_details: # early_filter_details is the filter_failures dict e.g. {"1_pLDDT": 1}
+                            if early_filter_details:  # early_filter_details is the filter_failures dict e.g. {"1_pLDDT": 1}
                                 for specific_model_failure_key in early_filter_details.keys():
                                     parts = specific_model_failure_key.split('_')
-                                    if len(parts) > 1 and parts[0].isdigit(): # e.g. "1_pLDDT" -> "pLDDT"
-                                        base_metric_name = ''.join(parts[1:]) # Corrected: was '_'.join, should be '' to match pLDDT from pLDDT
+                                    if len(parts) > 1 and parts[0].isdigit():  # e.g. "1_pLDDT" -> "pLDDT"
+                                        base_metric_name = ''.join(parts[
+                                                                       1:])  # Corrected: was '_'.join, should be '' to match pLDDT from pLDDT
                                         # Special case for i_pTM, i_pAE, i_pLDDT as they already contain an underscore
-                                        if parts[1] == "i" and len(parts) > 2: # e.g. "1_i_pTM" -> "i_pTM"
+                                        if parts[1] == "i" and len(parts) > 2:  # e.g. "1_i_pTM" -> "i_pTM"
                                             base_metric_name = parts[1] + "_" + ''.join(parts[2:])
                                         failed_base_metrics_for_this_design.add(base_metric_name)
-                                    else: # Should not happen with current predict_binder_complex failures, but good for robustness
+                                    else:  # Should not happen with current predict_binder_complex failures, but good for robustness
                                         failed_base_metrics_for_this_design.add(specific_model_failure_key)
 
                             for base_filter_col_name_in_log_csv in filter_column_names_for_rejected_log:
@@ -689,14 +809,16 @@ while True:
                                 else:
                                     rejected_data_list_for_csv.append(0)
                             insert_data(rejected_mpnn_full_stats_csv, rejected_data_list_for_csv)
-                            
+
                             mpnn_n += 1
                             continue
 
                         # calculate statistics for each model individually
                         for model_num in prediction_models:
-                            mpnn_design_pdb = os.path.join(design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-                            mpnn_design_relaxed = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+                            mpnn_design_pdb = os.path.join(design_paths["MPNN"],
+                                                           f"{mpnn_design_name}_model{model_num + 1}.pdb")
+                            mpnn_design_relaxed = os.path.join(design_paths["MPNN/Relaxed"],
+                                                               f"{mpnn_design_name}_model{model_num + 1}.pdb")
 
                             if os.path.exists(mpnn_design_pdb):
                                 # Calculate clashes before and after relaxation
@@ -704,19 +826,23 @@ while True:
                                 num_clashes_mpnn_relaxed = calculate_clash_score(mpnn_design_relaxed)
 
                                 # analyze interface scores for relaxed af2 trajectory
-                                mpnn_interface_scores, mpnn_interface_AA, mpnn_interface_residues = score_interface(mpnn_design_relaxed, binder_chain, use_pyrosetta=use_pyrosetta)
+                                mpnn_interface_scores, mpnn_interface_AA, mpnn_interface_residues = score_interface(
+                                    mpnn_design_relaxed, binder_chain, use_pyrosetta=use_pyrosetta)
 
                                 # secondary structure content of starting trajectory binder
-                                mpnn_alpha, mpnn_beta, mpnn_loops, mpnn_alpha_interface, mpnn_beta_interface, mpnn_loops_interface, mpnn_i_plddt, mpnn_ss_plddt = calc_ss_percentage(mpnn_design_pdb, advanced_settings, binder_chain)
-                                
+                                mpnn_alpha, mpnn_beta, mpnn_loops, mpnn_alpha_interface, mpnn_beta_interface, mpnn_loops_interface, mpnn_i_plddt, mpnn_ss_plddt = calc_ss_percentage(
+                                    mpnn_design_pdb, advanced_settings, binder_chain)
+
                                 # unaligned RMSD calculate to determine if binder is in the designed binding site
-                                rmsd_site = unaligned_rmsd(trajectory_pdb, mpnn_design_pdb, binder_chain, binder_chain, use_pyrosetta=use_pyrosetta)
+                                rmsd_site = unaligned_rmsd(trajectory_pdb, mpnn_design_pdb, binder_chain, binder_chain,
+                                                           use_pyrosetta=use_pyrosetta)
 
                                 # calculate RMSD of target compared to input PDB
-                                target_rmsd = target_pdb_rmsd(mpnn_design_pdb, target_settings["starting_pdb"], target_settings["chains"])
+                                target_rmsd = target_pdb_rmsd(mpnn_design_pdb, target_settings["starting_pdb"],
+                                                              target_settings["chains"])
 
                                 # add the additional statistics to the mpnn_complex_statistics dictionary
-                                mpnn_complex_statistics[model_num+1].update({
+                                mpnn_complex_statistics[model_num + 1].update({
                                     'i_pLDDT': mpnn_i_plddt,
                                     'ss_pLDDT': mpnn_ss_plddt,
                                     'Unrelaxed_Clashes': num_clashes_mpnn,
@@ -726,7 +852,7 @@ while True:
                                     'ShapeComplementarity': mpnn_interface_scores['interface_sc'],
                                     'PackStat': mpnn_interface_scores['interface_packstat'],
                                     'dG': mpnn_interface_scores['interface_dG'],
-                                    'dSASA': mpnn_interface_scores['interface_dSASA'], 
+                                    'dSASA': mpnn_interface_scores['interface_dSASA'],
                                     'dG/dSASA': mpnn_interface_scores['interface_dG_SASA_ratio'],
                                     'Interface_SASA_%': mpnn_interface_scores['interface_fraction'],
                                     'Interface_Hydrophobicity': mpnn_interface_scores['interface_hydrophobicity'],
@@ -734,7 +860,8 @@ while True:
                                     'n_InterfaceHbonds': mpnn_interface_scores['interface_interface_hbonds'],
                                     'InterfaceHbondsPercentage': mpnn_interface_scores['interface_hbond_percentage'],
                                     'n_InterfaceUnsatHbonds': mpnn_interface_scores['interface_delta_unsat_hbonds'],
-                                    'InterfaceUnsatHbondsPercentage': mpnn_interface_scores['interface_delta_unsat_hbonds_percentage'],
+                                    'InterfaceUnsatHbondsPercentage': mpnn_interface_scores[
+                                        'interface_delta_unsat_hbonds_percentage'],
                                     'InterfaceAAs': mpnn_interface_AA,
                                     'Interface_Helix%': mpnn_alpha_interface,
                                     'Interface_BetaSheet%': mpnn_beta_interface,
@@ -752,23 +879,27 @@ while True:
 
                         # calculate complex averages
                         mpnn_complex_averages = calculate_averages(mpnn_complex_statistics, handle_aa=True)
-                        
+
                         ### Predict binder alone in single sequence mode
-                        binder_statistics = predict_binder_alone(binder_prediction_model, mpnn_sequence['seq'], mpnn_design_name, length,
-                                                                trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths, 
-                                                                use_pyrosetta=use_pyrosetta)
+                        binder_statistics = predict_binder_alone(binder_prediction_model, mpnn_sequence['seq'],
+                                                                 mpnn_design_name, length,
+                                                                 trajectory_pdb, binder_chain, prediction_models,
+                                                                 advanced_settings, design_paths,
+                                                                 use_pyrosetta=use_pyrosetta)
 
                         # extract RMSDs of binder to the original trajectory
                         for model_num in prediction_models:
-                            mpnn_binder_pdb = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+                            mpnn_binder_pdb = os.path.join(design_paths["MPNN/Binder"],
+                                                           f"{mpnn_design_name}_model{model_num + 1}.pdb")
 
                             if os.path.exists(mpnn_binder_pdb):
-                                rmsd_binder = unaligned_rmsd(trajectory_pdb, mpnn_binder_pdb, binder_chain, "A", use_pyrosetta=use_pyrosetta)
+                                rmsd_binder = unaligned_rmsd(trajectory_pdb, mpnn_binder_pdb, binder_chain, "A",
+                                                             use_pyrosetta=use_pyrosetta)
 
                             # append to statistics
-                            binder_statistics[model_num+1].update({
-                                    'Binder_RMSD': rmsd_binder
-                                })
+                            binder_statistics[model_num + 1].update({
+                                'Binder_RMSD': rmsd_binder
+                            })
 
                             # save space by removing binder monomer models?
                             if advanced_settings["remove_binder_monomer"]:
@@ -778,22 +909,32 @@ while True:
                         binder_averages = calculate_averages(binder_statistics)
 
                         # analyze sequence to make sure there are no cysteins and it contains residues that absorb UV for detection
-                        seq_notes = validate_design_sequence(mpnn_sequence['seq'], mpnn_complex_averages.get('Relaxed_Clashes', None), advanced_settings)
+                        seq_notes = validate_design_sequence(mpnn_sequence['seq'],
+                                                             mpnn_complex_averages.get('Relaxed_Clashes', None),
+                                                             advanced_settings)
 
                         # measure time to generate design
                         mpnn_end_time = time.time() - mpnn_time
                         elapsed_mpnn_text = f"{'%d hours, %d minutes, %d seconds' % (int(mpnn_end_time // 3600), int((mpnn_end_time % 3600) // 60), int(mpnn_end_time % 60))}"
 
-
                         # Insert statistics about MPNN design into CSV, will return None if corresponding model does note exist
                         model_numbers = range(1, 6)
-                        statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
-                                            'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
-                                            'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
-                                            'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
+                        statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT',
+                                             'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score',
+                                             'Surface_Hydrophobicity',
+                                             'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA',
+                                             'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues',
+                                             'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
+                                             'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage',
+                                             'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%',
+                                             'Binder_Helix%',
+                                             'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD',
+                                             'Target_RMSD']
 
                         # Initialize mpnn_data with the non-statistical data
-                        mpnn_data = [mpnn_design_name, advanced_settings["design_algorithm"], length, seed, helicity_value, target_settings["target_hotspot_residues"], mpnn_sequence['seq'], mpnn_interface_residues, mpnn_score, mpnn_seqid]
+                        mpnn_data = [mpnn_design_name, advanced_settings["design_algorithm"], length, seed,
+                                     helicity_value, target_settings["target_hotspot_residues"], mpnn_sequence['seq'],
+                                     mpnn_interface_residues, mpnn_score, mpnn_seqid]
 
                         # Add the statistical data for mpnn_complex
                         for label in statistics_labels:
@@ -821,15 +962,16 @@ while True:
 
                         # Output the number part of the key
                         best_model_number = highest_plddt_key - 10
-                        best_model_pdb = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{best_model_number}.pdb")
+                        best_model_pdb = os.path.join(design_paths["MPNN/Relaxed"],
+                                                      f"{mpnn_design_name}_model{best_model_number}.pdb")
 
                         # run design data against filter thresholds
                         filter_conditions = check_filters(mpnn_data, design_labels, filters)
                         if filter_conditions == True:
-                            print(mpnn_design_name+" passed all filters")
+                            logger.info(f"{mpnn_design_name} passed all filters")
                             accepted_mpnn += 1
                             accepted_designs += 1
-                            
+
                             # copy designs to accepted folder
                             shutil.copy(best_model_pdb, design_paths["Accepted"])
 
@@ -839,9 +981,12 @@ while True:
 
                             # copy animation from accepted trajectory
                             if advanced_settings["save_design_animations"]:
-                                accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{design_name}.html")
+                                accepted_animation = os.path.join(design_paths["Accepted/Animation"],
+                                                                  f"{design_name}.html")
                                 if not os.path.exists(accepted_animation):
-                                    shutil.copy(os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html"), accepted_animation)
+                                    shutil.copy(
+                                        os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html"),
+                                        accepted_animation)
 
                             # copy plots of accepted trajectory
                             plot_files = os.listdir(design_paths["Trajectory/Plots"])
@@ -853,7 +998,7 @@ while True:
                                     shutil.copy(source_plot, target_plot)
 
                         else:
-                            print(f"Unmet filter conditions for {mpnn_design_name}")
+                            logger.info(f"Unmet filter conditions for {mpnn_design_name}")
                             failure_df = pd.read_csv(failure_csv)
                             special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
                             incremented_columns = set()
@@ -863,16 +1008,16 @@ while True:
                                 for prefix in special_prefixes:
                                     if column.startswith(prefix):
                                         base_column = column.split('_', 1)[1]
-                                        break # Corrected: was missing break
+                                        break  # Corrected: was missing break
 
                                 if base_column not in incremented_columns:
-                                    if base_column in failure_df.columns: # Check if column exists before incrementing
+                                    if base_column in failure_df.columns:  # Check if column exists before incrementing
                                         failure_df[base_column] = failure_df[base_column] + 1
                                     else:
                                         # This case should ideally not happen if generate_filter_pass_csv creates all potential base_columns
-                                        print(f"Warning: Base column '{base_column}' not found in {failure_csv}. It won't be incremented for this failure.")
+                                        logger.warning(f"Base column '{base_column}' not found in {failure_csv}. It won't be incremented for this failure.")
                                     incremented_columns.add(base_column)
-                            
+
                             failure_df.to_csv(failure_csv, index=False)
 
                             # Log to rejected_mpnn_full_stats.csv
@@ -883,12 +1028,12 @@ while True:
                                 else:
                                     rejected_data_list_for_csv.append(0)
                             insert_data(rejected_mpnn_full_stats_csv, rejected_data_list_for_csv)
-                            
+
                             shutil.copy(best_model_pdb, design_paths["Rejected"])
-                        
+
                         # increase MPNN design number
                         mpnn_n += 1
-                        
+
                         # Force garbage collection after each MPNN design to prevent file descriptor accumulation
                         gc.collect()
 
@@ -897,15 +1042,12 @@ while True:
                             break
 
                     if accepted_mpnn >= 1:
-                        print("Found "+str(accepted_mpnn)+" MPNN designs passing filters")
-                        print("")
+                        logger.info(f"Found {accepted_mpnn} MPNN designs passing filters")
                     else:
-                        print("No accepted MPNN designs found for this trajectory.")
-                        print("")
+                        logger.info("No accepted MPNN designs found for this trajectory.")
 
                 else:
-                    print('Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation')
-                    print("")
+                    logger.warning("Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation")
 
                 # save space by removing unrelaxed design trajectory PDB
                 if advanced_settings["remove_unrelaxed_trajectory"]:
@@ -914,28 +1056,28 @@ while True:
                 # measure time it took to generate designs for one trajectory
                 design_time = time.time() - design_start_time
                 design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
-                print("Design and validation of trajectory "+design_name+" took: "+design_time_text)
+                logger.info(f"Design and validation of trajectory {design_name} took: {design_time_text}")
 
             # analyse the rejection rate of trajectories to see if we need to readjust the design weights
             if trajectory_n >= advanced_settings["start_monitoring"] and advanced_settings["enable_rejection_check"]:
                 acceptance = accepted_designs / trajectory_n
                 if not acceptance >= advanced_settings["acceptance_rate"]:
-                    print("The ratio of successful designs is lower than defined acceptance rate! Consider changing your design settings!")
-                    print("Script execution stopping...")
+                    logger.warning("The ratio of successful designs is lower than defined acceptance rate! Consider changing your design settings!")
+                    logger.warning("Script execution stopping...")
                     break
 
         # increase trajectory number
         trajectory_n += 1
-        
+
         # Force garbage collection and clear DSSP cache every 10 trajectories to prevent memory/fd accumulation
         if trajectory_n % 10 == 0:
             clear_dssp_cache()
-            print(f"Cleared DSSP cache after {trajectory_n} trajectories")
-        
+            logger.debug(f"Cleared DSSP cache after {trajectory_n} trajectories")
+
         # Force garbage collection more frequently to prevent file descriptor accumulation
         gc.collect()
 
 ### Script finished
 elapsed_time = time.time() - script_start_time
 elapsed_text = f"{'%d hours, %d minutes, %d seconds' % (int(elapsed_time // 3600), int((elapsed_time % 3600) // 60), int(elapsed_time % 60))}"
-print("Finished all designs. Script execution for "+str(trajectory_n)+" trajectories took: "+elapsed_text)
+logger.info(f"Finished all designs. Script execution for {trajectory_n} trajectories took: {elapsed_text}")
