@@ -9,6 +9,10 @@ import time
 from importlib.resources import files
 from pathlib import Path
 
+from freebindcraft.jax_env import apply_default_xla_memory_env
+
+apply_default_xla_memory_env()
+
 import numpy as np
 import pandas as pd
 from colabdesign import mk_afdesign_model, clear_mem
@@ -444,6 +448,10 @@ logger.add(sys.stdout, level=_log_level, colorize=True,
 logger.add(_log_file, level="DEBUG", rotation="50 MB", retention=3,
            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}")
 logger.info(f"Logging to {_log_file}")
+logger.debug(
+    "XLA_PYTHON_CLIENT_PREALLOCATE={!r} (read by JAX at import; unset exports use on-demand growth)",
+    os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
+)
 
 # Suppress noisy third-party loggers (standard logging bridge)
 import logging as _logging
@@ -687,6 +695,15 @@ while True:
                                trajectory_target_rmsd,
                                trajectory_time_text, traj_seq_notes, settings_file, filters_file, advanced_file]
             insert_data(trajectory_csv, trajectory_data)
+
+            # Drop hallucination model; MPNN and validation use fresh AF2 models and PDB paths only.
+            try:
+                del trajectory
+            except Exception:
+                pass
+            trajectory = None
+            clear_mem()
+            gc.collect()
 
             # Skip MPNN optimization if no interface residues (no hotspot contact)
             if not trajectory_interface_residues:
@@ -1072,6 +1089,16 @@ while True:
                     logger.warning(
                         "Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation")
 
+                try:
+                    del complex_prediction_model
+                    del binder_prediction_model
+                except NameError:
+                    pass
+                except Exception:
+                    pass
+                clear_mem()
+                gc.collect()
+
                 # save space by removing unrelaxed design trajectory PDB
                 if advanced_settings["remove_unrelaxed_trajectory"]:
                     os.remove(trajectory_pdb)
@@ -1089,6 +1116,15 @@ while True:
                         "The ratio of successful designs is lower than defined acceptance rate! Consider changing your design settings!")
                     logger.warning("Script execution stopping...")
                     break
+
+        else:
+            # Clashing / low-confidence / etc.: release hallucination model before the next attempt.
+            try:
+                del trajectory
+            except Exception:
+                pass
+            clear_mem()
+            gc.collect()
 
         # increase trajectory number
         trajectory_n += 1
