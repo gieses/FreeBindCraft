@@ -12,6 +12,7 @@ license = { text = "MIT" }
 
 [project.scripts]
 bindcraft = "freebindcraft.bin:main"
+bindcraft-af-params-download = "freebindcraft.bin.bindcraft_download:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

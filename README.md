@@ -49,6 +49,27 @@ For the motivation behind the PyRosetta bypass, implementation details (OpenMM r
 
 ## Installation
 
+### Conda environment
+
+This methods builds a single-step conda environment and uses the `bindcraft` entrypoint to call the design workflow.
+
+1. Clone this modified repository:
+    ```bash
+    git clone https://github.com/gieses/FreeBindCraft
+    cd FreeBindCraft
+    ```
+2. Buid the conda environment
+    ```bash
+    mamba create -f environment.yml
+    ```
+3. Use Bindcraft as package
+    ```bash
+    conda activate freebindcraft
+    bindcraft --settings example/settings_target/PDL1.json
+    ```
+   
+
+### Original Installation Script
 1.  Clone this modified repository:
     ```bash
     git clone https://github.com/cytokineking/FreeBindCraft [install_folder]

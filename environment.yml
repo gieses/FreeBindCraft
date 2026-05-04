@@ -1,6 +1,6 @@
-# simplified environmental set-up, colabfold and freebindcraft need special treatment after installation
+# *WIP freebindcraft conda environment.
 # hook: pip install git+https://github.com/sokrypton/ColabDesign.git --no-deps
-# hook: pip install git+https://github.com/cytokineking/FreeBindCraft --no-deps
+# hook: pip install git+https://github.com/gieses/FreeBindCraft
 
 name: freebindcraft
 channels:
@@ -41,4 +41,3 @@ dependencies:
   - loguru
   - pip:
       - freesasa
-      - git+https://github.com/sokrypton/ColabDesign.git

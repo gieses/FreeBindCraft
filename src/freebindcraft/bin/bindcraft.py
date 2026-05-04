@@ -6,13 +6,14 @@ import os
 import shutil
 import sys
 import time
-from pathlib import Path
 from importlib.resources import files
-from loguru import logger
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from colabdesign import mk_afdesign_model, clear_mem
 from colabdesign.shared.utils import copy_dict
+from freebindcraft.bin.bindcraft_download import ensure_af_params_available
 from freebindcraft.functions.biopython_utils import (
     calc_ss_percentage,
     calculate_clash_score,
@@ -53,6 +54,7 @@ from freebindcraft.functions.pyrosetta_utils import (
     unaligned_rmsd,
 )
 from loguru import logger
+from loguru import logger
 
 try:
     import resource  # POSIX-only; used to raise RLIMIT_NOFILE (ulimit -n)
@@ -64,6 +66,7 @@ SETTINGS_ROOT = ASSETS_ROOT / "settings_advanced"
 FILTERS_ROOT = ASSETS_ROOT / "settings_filters"
 AVAILABLE_SETTINGS = list(SETTINGS_ROOT.glob("*json"))
 AVAILABLE_FILTERS = list(FILTERS_ROOT.glob("*json"))
+DEFAULT_AF_PARAMS_DIR = Path.home() / ".bindcraft" / "weights"
 
 
 def _bump_open_files_limit(min_soft=65536):
@@ -132,8 +135,8 @@ parser.add_argument('--filters', '-f', type=str, default=FILTERS_ROOT / 'default
                     help='Path to the filters.json file used to filter design.')
 parser.add_argument('--advanced', '-a', type=str, default=SETTINGS_ROOT / 'default_4stage_multimer.json',
                     help='Path to the advanced.json file with additional design settings.')
-parser.add_argument('--no-pyrosetta', action='store_true',
-                    help='Run without PyRosetta (skips relaxation and PyRosetta-based scoring)')
+parser.add_argument('--use-pyrosetta', action='store_true', default=False,
+                    help='Enable PyRosetta (relaxation + PyRosetta-based scoring). Default: off')
 parser.add_argument('--verbose', action='store_true',
                     help='Enable detailed timing/progress logs')
 parser.add_argument('--debug-pdbs', action='store_true',
@@ -148,7 +151,9 @@ parser.add_argument('--rank-by', type=str, default='i_pTM',
                     choices=['i_pTM', 'ipSAE'],
                     help='Metric to rank final designs by')
 parser.add_argument('--params-dir', type=str, default=None,
-                    help='Path to the AlphaFold2 model parameters directory. Overrides the af_params_dir value set in the advanced settings JSON.')
+                    help='Path to the AlphaFold2 model parameters directory. '
+                         'Overrides the af_params_dir value set in the advanced settings JSON. '
+                         '(default: ~/.bindcraft/weights')
 
 args = parser.parse_args()
 
@@ -412,7 +417,7 @@ def _prompt_interactive_and_prepare_args(args):
     args.debug_pdbs = debug_pdbs
     args.no_plots = (not plots_on)
     args.no_animations = (not animations_on)
-    args.no_pyrosetta = (not run_with_pyrosetta)
+    args.use_pyrosetta = run_with_pyrosetta
     args.rank_by = rank_by_metric
 
     return args
@@ -442,6 +447,7 @@ logger.info(f"Logging to {_log_file}")
 
 # Suppress noisy third-party loggers (standard logging bridge)
 import logging as _logging
+
 for _noisy in ("jax", "jaxlib", "jax._src", "absl", "flax", "colabdesign", "tensorflow", "xla"):
     _logging.getLogger(_noisy).setLevel(_logging.WARNING)
 
@@ -475,8 +481,18 @@ if args.no_plots:
     advanced_settings["save_design_trajectory_plots"] = False
 if args.no_animations:
     advanced_settings["save_design_animations"] = False
+
+# params dir
 if args.params_dir:
-    advanced_settings["af_params_dir"] = args.params_dir
+    # Explicit CLI override — use it
+    _af_params_dir = args.params_dir
+elif advanced_settings.get("af_params_dir"):
+    # Value from the advanced settings JSON
+    _af_params_dir = advanced_settings["af_params_dir"]
+else:
+    # Fall back to the default location
+    _af_params_dir = DEFAULT_AF_PARAMS_DIR
+advanced_settings["af_params_dir"] = ensure_af_params_available(_af_params_dir)
 
 ### generate directories, design path names can be found within the function
 design_paths = generate_directories(target_settings["design_path"])
@@ -505,13 +521,15 @@ generate_filter_pass_csv(failure_csv, args.filters)
 if not os.path.exists(failure_csv):
     # This should ideally not happen if generate_filter_pass_csv worked, create an empty one if it's missing.
     temp_failure_df_for_cols = pd.DataFrame()
-    logger.warning(f"{failure_csv} was not found after generate_filter_pass_csv. rejected_mpnn_full_stats.csv might have incorrect filter columns.")
+    logger.warning(
+        f"{failure_csv} was not found after generate_filter_pass_csv. rejected_mpnn_full_stats.csv might have incorrect filter columns.")
 else:
     try:
         temp_failure_df_for_cols = pd.read_csv(failure_csv)
     except pd.errors.EmptyDataError:
         # If failure_csv is empty we need to get column names from how generate_filter_pass_csv would create them.
-        logger.warning(f"{failure_csv} is empty. rejected_mpnn_full_stats.csv may lack detailed filter columns initially if no filters are defined or an issue occurred.")
+        logger.warning(
+            f"{failure_csv} is empty. rejected_mpnn_full_stats.csv may lack detailed filter columns initially if no filters are defined or an issue occurred.")
         temp_failure_df_for_cols = pd.DataFrame()  # Fallback- we don't want BindCraft to crash over this
 
 filter_column_names_for_rejected_log = temp_failure_df_for_cols.columns.tolist()
@@ -526,9 +544,8 @@ create_dataframe(rejected_mpnn_full_stats_csv, rejected_stats_columns)
 ### initialise PyRosetta if not disabled
 use_pyrosetta = False
 
-if args.no_pyrosetta:
-    # Quiet when user explicitly disables PyRosetta
-    logger.info("Running in PyRosetta-free mode as requested by --no-pyrosetta flag.")
+if not args.use_pyrosetta:
+    logger.info("Running in PyRosetta-free mode (default). Enable with --use-pyrosetta.")
 else:
     if 'PYROSETTA_AVAILABLE' in globals() and PYROSETTA_AVAILABLE and pr is not None:
         try:
@@ -694,11 +711,14 @@ while True:
                         if not df_mpnn.empty:
                             existing_mpnn_sequences = set(df_mpnn['Sequence'].dropna().astype(str).values)
                     except pd.errors.EmptyDataError:
-                        logger.warning(f"{mpnn_csv} is empty or has no columns. Starting with no existing MPNN sequences.")
+                        logger.warning(
+                            f"{mpnn_csv} is empty or has no columns. Starting with no existing MPNN sequences.")
                     except KeyError:
-                        logger.warning(f"'Sequence' column not found in {mpnn_csv}. Starting with no existing MPNN sequences.")
+                        logger.warning(
+                            f"'Sequence' column not found in {mpnn_csv}. Starting with no existing MPNN sequences.")
                     except Exception as e:
-                        logger.warning(f"Could not read existing MPNN sequences from {mpnn_csv} due to: {e}. Starting with no existing MPNN sequences.")
+                        logger.warning(
+                            f"Could not read existing MPNN sequences from {mpnn_csv} due to: {e}. Starting with no existing MPNN sequences.")
                 else:
                     logger.info(f"{mpnn_csv} does not exist or is empty. Starting with no existing MPNN sequences.")
 
@@ -784,7 +804,8 @@ while True:
 
                         # if AF2 filters are not passed then skip the scoring but log the failure
                         if not pass_af2_filters:
-                            logger.warning(f"Base AF2 filters not passed for {mpnn_design_name}, skipping full interface scoring.")
+                            logger.warning(
+                                f"Base AF2 filters not passed for {mpnn_design_name}, skipping full interface scoring.")
 
                             # Log to rejected_mpnn_full_stats.csv for early AF2 failures
                             rejected_data_list_for_csv = [mpnn_design_name, mpnn_sequence['seq']]
@@ -1015,7 +1036,8 @@ while True:
                                         failure_df[base_column] = failure_df[base_column] + 1
                                     else:
                                         # This case should ideally not happen if generate_filter_pass_csv creates all potential base_columns
-                                        logger.warning(f"Base column '{base_column}' not found in {failure_csv}. It won't be incremented for this failure.")
+                                        logger.warning(
+                                            f"Base column '{base_column}' not found in {failure_csv}. It won't be incremented for this failure.")
                                     incremented_columns.add(base_column)
 
                             failure_df.to_csv(failure_csv, index=False)
@@ -1047,7 +1069,8 @@ while True:
                         logger.info("No accepted MPNN designs found for this trajectory.")
 
                 else:
-                    logger.warning("Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation")
+                    logger.warning(
+                        "Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation")
 
                 # save space by removing unrelaxed design trajectory PDB
                 if advanced_settings["remove_unrelaxed_trajectory"]:
@@ -1062,7 +1085,8 @@ while True:
             if trajectory_n >= advanced_settings["start_monitoring"] and advanced_settings["enable_rejection_check"]:
                 acceptance = accepted_designs / trajectory_n
                 if not acceptance >= advanced_settings["acceptance_rate"]:
-                    logger.warning("The ratio of successful designs is lower than defined acceptance rate! Consider changing your design settings!")
+                    logger.warning(
+                        "The ratio of successful designs is lower than defined acceptance rate! Consider changing your design settings!")
                     logger.warning("Script execution stopping...")
                     break
 
