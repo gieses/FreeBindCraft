@@ -39,5 +39,8 @@ dependencies:
   - jaxlib=*=cuda*
   - dssp
   - loguru
+  - pip
   - pip:
       - freesasa
+      - git+https://github.com/gieses/FreeBindCraft.git
+      - git+https://github.com/sokrypton/ColabDesign.git
