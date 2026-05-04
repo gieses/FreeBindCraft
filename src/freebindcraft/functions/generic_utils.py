@@ -2,12 +2,14 @@
 ################## General functions
 ####################################
 ### Import dependencies
+import importlib.util
 import json
 import os
 import shutil
 import stat
 import time
 import zipfile
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -249,6 +251,40 @@ def check_jax_gpu():
             print(f"{device.device_kind}{i + 1}: {device.platform}")
 
 
+def bundled_json_path(asset_subdir: str, basename: str) -> Path | None:
+    """Return path to ``basename`` under packaged ``assets/<asset_subdir>/``, or None if missing."""
+    spec = importlib.util.find_spec("freebindcraft")
+    if not spec or not spec.origin:
+        return None
+    candidate = Path(spec.origin).resolve().parent / "assets" / asset_subdir / basename
+    return candidate if candidate.is_file() else None
+
+
+def resolve_local_or_bundled_json(user_path: str, asset_subdir: str, label: str) -> str:
+    """Use *user_path* if it exists on disk; otherwise use the same basename from bundled assets."""
+    expanded = os.path.normpath(os.path.expanduser(str(user_path)))
+    if os.path.isfile(expanded):
+        return expanded
+    basename = os.path.basename(expanded)
+    bundled = bundled_json_path(asset_subdir, basename)
+    if bundled is not None:
+        try:
+            from loguru import logger
+
+            logger.warning(
+                "{} file not found at {!r}; loading bundled preset from {!r}",
+                label,
+                user_path,
+                str(bundled),
+            )
+        except Exception:
+            vprint(
+                f"[{label}] file not found at {user_path!r}; loading bundled preset from {bundled!r}"
+            )
+        return str(bundled)
+    return expanded
+
+
 # check all input files being passed
 def perform_input_check(args):
     # Get the directory of the current script
@@ -266,6 +302,9 @@ def perform_input_check(args):
     # Set a random advanced json settings file if not provided
     if not args.advanced:
         args.advanced = os.path.join(binder_script_path, 'settings_advanced', 'default_4stage_multimer.json')
+
+    args.filters = resolve_local_or_bundled_json(str(args.filters), "settings_filters", "Filters")
+    args.advanced = resolve_local_or_bundled_json(str(args.advanced), "settings_advanced", "Advanced settings")
 
     return args.settings, args.filters, args.advanced
 
